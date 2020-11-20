@@ -547,3 +547,368 @@ impl<W: Write> Drop for Builder<W> {
         let _ = self.finish();
     }
 }
+
+// Hello there, person ! Welcome to my weird hack that I programmed to transform the builder
+// into a Read-able struct
+//
+// It's holding together and should work but it needs major refactoring because I am so not proud
+// of this mess.
+//
+// TODO:
+//
+// - PaddedReader (for the 512 bytes padding of the data)
+// - ChainedReader (to chain the readers of the EntryReader)
+// - Refactor TarReader mess
+// - Change the stack content into a clear enum (Dir, DirAll, File, Link, ...)
+// - Fix symlinks
+// - Rename append_file to append_path_with_name
+// - Use the builder's test suite on this BuilderReader.
+
+use std::path::PathBuf;
+
+/// TODO DOC
+pub struct BuilderReader {
+    stack: Vec<(PathBuf, PathBuf, PathBuf, bool, bool)>,
+}
+
+impl BuilderReader {
+    /// TODO DOC
+    pub fn new() -> Self {
+        Self { stack: Vec::new() }
+    }
+
+    /// TODO DOC
+    pub fn append_dir_all<P, Q>(&mut self, path: P, src_path: Q) -> io::Result<()>
+    where
+        P: AsRef<Path>,
+        Q: AsRef<Path>,
+    {
+        self.stack.push((
+            path.as_ref().to_owned(),
+            src_path.as_ref().to_owned(),
+            src_path.as_ref().to_owned(),
+            true,
+            false,
+        ));
+        Ok(())
+    }
+
+    /// TODO DOC
+    pub fn append_file<P: AsRef<Path>, Q: AsRef<Path>>(
+        &mut self,
+        path: P,
+        src_path: Q,
+    ) -> io::Result<()> {
+        self.stack.push((
+            path.as_ref().to_owned(),
+            src_path.as_ref().to_owned(),
+            src_path.as_ref().to_owned(),
+            false,
+            false,
+        ));
+        Ok(())
+    }
+
+    /// TODO DOC
+    pub fn into_reader(self) -> TarReader {
+        TarReader {
+            stack: self.stack,
+            mode: HeaderMode::Complete,
+            follow: true,
+            finished: false,
+            current_reader: None,
+        }
+    }
+}
+
+use std::io::Read;
+
+/// TODO DOC
+pub struct TarReader {
+    stack: Vec<(PathBuf, PathBuf, PathBuf, bool, bool)>,
+    mode: HeaderMode,
+    follow: bool,
+    finished: bool,
+    current_reader: Option<Box<dyn Read + Send>>,
+}
+
+impl TarReader {
+    /*fn pop_stack(&mut self) -> io::Result<Box<dyn Read>> {
+        unimplemented!();
+    }*/
+
+    /*    fn put_reader_stack(&mut self, reader: Box<dyn Read>) -> io::Result<()> {
+        Ok(())
+    }*/
+}
+
+impl Read for TarReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut total_read_amount = 0;
+        let mut to_read = buf;
+        'outerloop: loop {
+            //while let Some((src, is_dir, is_symlink)) = stack.pop() {
+            if let Some(mut reader) = self.current_reader.take() {
+                loop {
+                    let read_amount = reader.read(to_read)?;
+                    total_read_amount += read_amount;
+                    if read_amount == 0 {
+                        break;
+                    }
+                    to_read = &mut to_read[read_amount..];
+                    if to_read.len() == 0 {
+                        self.current_reader = Some(reader);
+                        break 'outerloop;
+                    }
+                }
+            }
+            let next_reader = if let Some((path, src_path, src, is_dir, is_symlink)) =
+                self.stack.pop()
+            {
+                let dest = path.join(src.strip_prefix(&src_path).unwrap());
+                // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
+                if is_dir || (is_symlink && self.follow && src.is_dir()) {
+                    for entry in fs::read_dir(&src)? {
+                        let entry = entry?;
+                        let file_type = entry.file_type()?;
+
+                        self.stack.push((
+                            path.clone(),
+                            src_path.clone(),
+                            entry.path(),
+                            file_type.is_dir(),
+                            file_type.is_symlink(),
+                        ));
+                    }
+                    if &dest != Path::new("") {
+                        let reader = append_dir_read(&dest, &src, self.mode)?;
+                        Some(Box::new(reader) as Box<dyn Read + Send>)
+                    } else {
+                        Some(Box::new(std::io::empty()) as Box<dyn Read + Send>)
+                    }
+                }
+                //TODO: symlinks
+                /*else if !follow && is_symlink {
+                    let stat = fs::symlink_metadata(&src)?;
+                    let link_name = fs::read_link(&src)?;
+                    append_fs(dst, &dest, &stat, &mut io::empty(), mode, Some(&link_name))?;
+                }*/
+                else {
+                    let dest = if src.strip_prefix(&src_path).unwrap() == Path::new("") {
+                        &path
+                    } else {
+                        &dest
+                    };
+                    let reader = append_file_read(&dest, fs::File::open(&src)?, self.mode)?;
+                    Some(Box::new(reader) as Box<dyn Read + Send>)
+                }
+            } else {
+                if !self.finished {
+                    self.finished = true;
+                    Some(Box::new(std::io::Cursor::new(vec![0u8; 1024])) as Box<dyn Read + Send>)
+                } else {
+                    None
+                }
+            };
+            if next_reader.is_none() {
+                break 'outerloop;
+            } else {
+                self.current_reader = next_reader;
+            }
+        }
+        Ok(total_read_amount)
+    }
+}
+
+fn append_dir_read(path: &Path, src_path: &Path, mode: HeaderMode) -> io::Result<EntryReader> {
+    let stat = fs::metadata(src_path)?;
+    append_fs_read(path, &stat, Box::new(io::empty()), mode, None)
+}
+
+fn append_file_read(path: &Path, file: fs::File, mode: HeaderMode) -> io::Result<EntryReader> {
+    let stat = file.metadata()?;
+    append_fs_read(path, &stat, Box::new(file), mode, None)
+}
+
+fn append_fs_read(
+    path: &Path,
+    meta: &fs::Metadata,
+    read: Box<dyn Read + Send>,
+    mode: HeaderMode,
+    link_name: Option<&Path>,
+) -> io::Result<EntryReader> {
+    let mut header = Header::new_gnu();
+
+    let header_path = prepare_header_path_read(&mut header, path)?;
+    header.set_metadata_in_mode(meta, mode);
+    let header_link = if let Some(link_name) = link_name {
+        prepare_header_link_read(&mut header, link_name)?
+    } else {
+        None
+    };
+    header.set_cksum();
+    Ok(EntryReader {
+        header,
+        header_path: header_path.map(|(header, reader)| {
+            Box::new(EntryReader {
+                header,
+                data: reader,
+                header_path: None,
+                header_link: None,
+                header_done: false,
+                data_done: false,
+                data_read_byte_amount: 0,
+                current_reader: None,
+            }) as Box<dyn Read + Send>
+        }),
+        header_link: header_link.map(|(header, reader)| {
+            Box::new(EntryReader {
+                header,
+                data: reader,
+                header_path: None,
+                header_link: None,
+                header_done: false,
+                data_done: false,
+                data_read_byte_amount: 0,
+                current_reader: None,
+            }) as Box<dyn Read + Send>
+        }),
+        data: read,
+        header_done: false,
+        data_done: false,
+        data_read_byte_amount: 0,
+        current_reader: None,
+    })
+    //append(dst, &header, read)
+}
+
+fn prepare_header_path_read(
+    header: &mut Header,
+    path: &Path,
+) -> io::Result<Option<(Header, Box<dyn Read + Send>)>> {
+    // Try to encode the path directly in the header, but if it ends up not
+    // working (probably because it's too long) then try to use the GNU-specific
+    // long name extension by emitting an entry which indicates that it's the
+    // filename.
+    if let Err(e) = header.set_path(path) {
+        let data = path2bytes(&path)?;
+        let max = header.as_old().name.len();
+        //  Since e isn't specific enough to let us know the path is indeed too
+        //  long, verify it first before using the extension.
+        if data.len() < max {
+            return Err(e);
+        }
+        let header2 = prepare_header(data.len() as u64, b'L');
+        // null-terminated string
+        //let mut data2 = data.clone().into_owned().chain(io::repeat(0).take(1));
+        let mut data2 = data.clone().into_owned();
+        data2.push(0);
+        let data2 = std::io::Cursor::new(data2);
+        //append(dst, &header2, &mut data2)?;
+        // Truncate the path to store in the header we're about to emit to
+        // ensure we've got something at least mentioned.
+        let path = bytes2path(Cow::Borrowed(&data[..max]))?;
+        header.set_path(&path)?;
+        Ok(Some((header2, Box::new(data2))))
+    } else {
+        Ok(None)
+    }
+}
+
+fn prepare_header_link_read(
+    header: &mut Header,
+    link_name: &Path,
+) -> io::Result<Option<(Header, Box<dyn Read + Send>)>> {
+    // Same as previous function but for linkname
+    if let Err(e) = header.set_link_name(&link_name) {
+        let data = path2bytes(&link_name)?;
+        if data.len() < header.as_old().linkname.len() {
+            return Err(e);
+        }
+        let header2 = prepare_header(data.len() as u64, b'K');
+        let mut data2 = data.clone().into_owned();
+        data2.push(0);
+        let data2 = std::io::Cursor::new(data2);
+        Ok(Some((header2, Box::new(data2))))
+    //append(dst, &header2, &mut data2)?;
+    } else {
+        Ok(None)
+    }
+}
+
+struct EntryReader {
+    data: Box<dyn Read + Send>,
+    header: Header,
+    header_path: Option<Box<dyn Read + Send>>,
+    header_link: Option<Box<dyn Read + Send>>,
+    header_done: bool,
+    data_done: bool,
+    data_read_byte_amount: u64,
+    current_reader: Option<Box<dyn Read + Send>>,
+}
+
+impl Read for EntryReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut total_read_amount = 0;
+        let mut to_read = buf;
+        'outerloop: loop {
+            if let Some(mut reader) = self.current_reader.take() {
+                loop {
+                    let read_amount = reader.read(to_read)?;
+                    total_read_amount += read_amount;
+                    if read_amount == 0 {
+                        break;
+                    }
+                    to_read = &mut to_read[read_amount..];
+                    if to_read.len() == 0 {
+                        self.current_reader = Some(reader);
+                        break 'outerloop;
+                    }
+                }
+            } else {
+                if let Some(reader) = self.header_path.take() {
+                    self.current_reader = Some(reader);
+                } else if let Some(reader) = self.header_link.take() {
+                    self.current_reader = Some(reader);
+                } else if !self.header_done {
+                    self.current_reader = Some(Box::new(std::io::Cursor::new(
+                        self.header
+                            .as_bytes()
+                            .into_iter()
+                            .map(|e| *e)
+                            .collect::<Vec<u8>>(),
+                    )));
+                    self.header_done = true;
+                } else {
+                    if !self.data_done {
+                        loop {
+                            let read_amount = self.data.read(to_read)?;
+                            total_read_amount += read_amount;
+                            self.data_read_byte_amount += read_amount as u64;
+                            if read_amount == 0 {
+                                break;
+                            }
+                            to_read = &mut to_read[read_amount..];
+                            if to_read.len() == 0 {
+                                break 'outerloop;
+                            }
+                        }
+                        self.data_done = true;
+                        //TODO: padded reader
+                        let remaining_byte_padding =
+                            (512 - (self.data_read_byte_amount % 512) as usize) % 512;
+                        if remaining_byte_padding > 0 {
+                            self.current_reader = Some(Box::new(std::io::Cursor::new(vec![
+                                0;
+                                remaining_byte_padding
+                            ])));
+                        }
+                    } else {
+                        break 'outerloop;
+                    }
+                }
+            }
+        }
+        Ok(total_read_amount)
+    }
+}
